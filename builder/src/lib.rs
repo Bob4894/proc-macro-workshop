@@ -58,7 +58,9 @@ impl BuilderDeriveField {
 	}
 
 	fn try_from_vec(field: &Field) -> Option<Self> {
-		let Field { ident, ty, .. } = field;
+		let Field {
+			ident, ty, attrs, ..
+		} = field;
 		let ident = ident.as_ref()?;
 
 		let ty_inner = Self::try_from_inner(ty, |name| {
@@ -68,10 +70,47 @@ impl BuilderDeriveField {
 			)
 		})?;
 
+		let each = attrs.iter().find_map(|attr| {
+			if !matches!(attr.style, syn::AttrStyle::Outer) {
+				return None;
+			}
+
+			let list = match attr {
+				syn::Attribute {
+					meta: syn::Meta::List(list),
+					..
+				} => list,
+				_ => return None,
+			};
+
+			let syn::ExprAssign { left, right, .. } = list.parse_args().ok()?;
+
+			let syn::Expr::Path(left) = *left else {
+				return None;
+			};
+
+			if left.path.segments.len() != 1 {
+				return None;
+			}
+
+			if left.path.segments[0].ident.to_string() != "each" {
+				return None;
+			}
+
+			let syn::Expr::Lit(syn::ExprLit {
+				lit: syn::Lit::Str(right),
+				..
+			}) = *right
+			else {
+				return None;
+			};
+
+			Some(right)
+		})?;
+
 		Some(Self::Each {
 			ident: ident.clone(),
-			each_ident: Ident::new(&format!("{}_each", ident), ident.span()),
-			// each_ident: each_ident.clone(),
+			each_ident: Ident::new(&each.value(), each.span()),
 			ty: ty_inner,
 		})
 	}

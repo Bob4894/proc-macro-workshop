@@ -39,21 +39,25 @@ impl BuilderDeriveField {
 		let Field { ident, ty, .. } = field;
 		let ident = ident.as_ref()?;
 
-		let ty_inner = Self::try_from_inner(ty, |name| {
-			matches!(
-				name,
-				"Option"
-					| "option::Option"
-					| "std::option::Option"
-					| "core::option::Option"
-					| "::std::option::Option"
-					| "::core::option::Option"
-			)
+		let ty_inner = Self::try_from_inner(ty, |segments| match &*segments {
+			[a] => {
+				matches!(a.as_str(), "Option")
+			}
+			[a, b] => {
+				matches!((a.as_str(), b.as_str()), ("option", "Option"))
+			}
+			[a, b, c] => {
+				matches!(
+					(a.as_str(), b.as_str(), c.as_str()),
+					("std" | "core", "option", "Option")
+				)
+			}
+			_ => false,
 		})?;
 
 		Some(Self::Optional {
 			ident: ident.clone(),
-			ty: ty_inner,
+			ty: ty_inner.clone(),
 		})
 	}
 
@@ -63,11 +67,17 @@ impl BuilderDeriveField {
 		} = field;
 		let ident = ident.as_ref()?;
 
-		let ty_inner = Self::try_from_inner(ty, |name| {
-			matches!(
-				name,
-				"Vec" | "vec::Vec" | "std::vec::Vec" | "::std::vec::Vec"
-			)
+		let ty_inner = Self::try_from_inner(ty, |segments| match &*segments {
+			[a] => {
+				matches!(a.as_str(), "Vec")
+			}
+			[a, b] => {
+				matches!((a.as_str(), b.as_str()), ("vec", "Vec"))
+			}
+			[a, b, c] => {
+				matches!((a.as_str(), b.as_str(), c.as_str()), ("std", "vec", "Vec"))
+			}
+			_ => false,
 		})?;
 
 		let each = attrs.iter().find_map(|attr| {
@@ -111,13 +121,13 @@ impl BuilderDeriveField {
 		Some(Self::Each {
 			ident: ident.clone(),
 			each_ident: Ident::new(&each.value(), each.span()),
-			ty: ty_inner,
+			ty: ty_inner.clone(),
 		})
 	}
 
-	fn try_from_inner<F>(ty: &Type, check_name: F) -> Option<Type>
+	fn try_from_inner<F>(ty: &Type, check_path: F) -> Option<&Type>
 	where
-		F: (FnOnce(&str) -> bool),
+		F: (FnOnce(Vec<String>) -> bool),
 	{
 		let Type::Path(syn::TypePath {
 			path: syn::Path { segments, .. },
@@ -127,13 +137,11 @@ impl BuilderDeriveField {
 			return None;
 		};
 
-		let segment = segments.get(0)?;
-
-		if !check_name(&segment.ident.to_string()) {
+		if !check_path(segments.iter().map(|seg| seg.ident.to_string()).collect()) {
 			return None;
 		}
 
-		let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+		let syn::PathArguments::AngleBracketed(arguments) = &segments.last()?.arguments else {
 			return None;
 		};
 
@@ -147,7 +155,7 @@ impl BuilderDeriveField {
 			return None;
 		};
 
-		Some(ty_inner.clone())
+		Some(ty_inner)
 	}
 }
 

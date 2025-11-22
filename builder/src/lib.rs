@@ -18,6 +18,17 @@ enum BuilderDeriveField {
 	},
 }
 
+enum BuilderDeriveFieldTryFromError {
+	Recoverable,
+	Unrecoverable(syn::Error),
+}
+
+impl From<syn::Error> for BuilderDeriveFieldTryFromError {
+	fn from(value: syn::Error) -> Self {
+		Self::Unrecoverable(value)
+	}
+}
+
 impl BuilderDeriveField {
 	fn ident(&self) -> &Ident {
 		match self {
@@ -35,9 +46,11 @@ impl BuilderDeriveField {
 		}
 	}
 
-	fn try_from_option(field: &Field) -> Option<Self> {
+	fn try_from_option(field: &Field) -> Result<Self, BuilderDeriveFieldTryFromError> {
 		let Field { ident, ty, .. } = field;
-		let ident = ident.as_ref()?;
+		let ident = ident
+			.as_ref()
+			.ok_or(BuilderDeriveFieldTryFromError::Recoverable)?;
 
 		let ty_inner = Self::try_from_inner(ty, |segments| match &*segments {
 			[a] => {
@@ -53,19 +66,22 @@ impl BuilderDeriveField {
 				)
 			}
 			_ => false,
-		})?;
+		})
+		.ok_or(BuilderDeriveFieldTryFromError::Recoverable)?;
 
-		Some(Self::Optional {
+		Ok(Self::Optional {
 			ident: ident.clone(),
 			ty: ty_inner.clone(),
 		})
 	}
 
-	fn try_from_vec(field: &Field) -> Option<Self> {
+	fn try_from_vec(field: &Field) -> Result<Self, BuilderDeriveFieldTryFromError> {
 		let Field {
 			ident, ty, attrs, ..
 		} = field;
-		let ident = ident.as_ref()?;
+		let ident = ident
+			.as_ref()
+			.ok_or(BuilderDeriveFieldTryFromError::Recoverable)?;
 
 		let ty_inner = Self::try_from_inner(ty, |segments| match &*segments {
 			[a] => {
@@ -78,47 +94,50 @@ impl BuilderDeriveField {
 				matches!((a.as_str(), b.as_str(), c.as_str()), ("std", "vec", "Vec"))
 			}
 			_ => false,
-		})?;
+		})
+		.ok_or(BuilderDeriveFieldTryFromError::Recoverable)?;
 
-		let each = attrs.iter().find_map(|attr| {
-			if !matches!(attr.style, syn::AttrStyle::Outer) {
-				return None;
-			}
+		let each = attrs
+			.iter()
+			.find_map(|attr| {
+				if !matches!(attr.style, syn::AttrStyle::Outer) {
+					return None;
+				}
 
-			let list = match attr {
-				syn::Attribute {
-					meta: syn::Meta::List(list),
+				let list = match attr {
+					syn::Attribute {
+						meta: syn::Meta::List(list),
+						..
+					} => list,
+					_ => return None,
+				};
+
+				let syn::ExprAssign { left, right, .. } = list.parse_args().ok()?;
+
+				let syn::Expr::Path(left) = *left else {
+					return None;
+				};
+
+				if left.path.segments.len() != 1 || left.path.segments[0].ident.to_string() != "each" {
+					return Some(Err(syn::Error::new_spanned(
+						list,
+						"expected `builder(each = \"...\")`",
+					)));
+				}
+
+				let syn::Expr::Lit(syn::ExprLit {
+					lit: syn::Lit::Str(right),
 					..
-				} => list,
-				_ => return None,
-			};
+				}) = *right
+				else {
+					return None;
+				};
 
-			let syn::ExprAssign { left, right, .. } = list.parse_args().ok()?;
+				Some(Ok(right))
+			})
+			.ok_or(BuilderDeriveFieldTryFromError::Recoverable)??;
 
-			let syn::Expr::Path(left) = *left else {
-				return None;
-			};
-
-			if left.path.segments.len() != 1 {
-				return None;
-			}
-
-			if left.path.segments[0].ident.to_string() != "each" {
-				return None;
-			}
-
-			let syn::Expr::Lit(syn::ExprLit {
-				lit: syn::Lit::Str(right),
-				..
-			}) = *right
-			else {
-				return None;
-			};
-
-			Some(right)
-		})?;
-
-		Some(Self::Each {
+		Ok(Self::Each {
 			ident: ident.clone(),
 			each_ident: Ident::new(&each.value(), each.span()),
 			ty: ty_inner.clone(),
@@ -159,27 +178,35 @@ impl BuilderDeriveField {
 	}
 }
 
-#[derive(Debug)]
-enum BuilderDeriveFieldFromSynFieldError {
-	NoIdent,
-}
-
 impl TryFrom<Field> for BuilderDeriveField {
-	type Error = BuilderDeriveFieldFromSynFieldError;
+	type Error = syn::Error;
 
 	fn try_from(field: Field) -> Result<Self, Self::Error> {
-		if let Some(bdf) = Self::try_from_option(&field) {
-			return Ok(bdf);
+		match Self::try_from_option(&field) {
+			Ok(bdf) => return Ok(bdf),
+			Err(BuilderDeriveFieldTryFromError::Unrecoverable(e)) => {
+				return Err(e);
+			}
+			_ => {}
 		}
 
-		if let Some(bdf) = Self::try_from_vec(&field) {
-			return Ok(bdf);
+		match Self::try_from_vec(&field) {
+			Ok(bdf) => return Ok(bdf),
+			Err(BuilderDeriveFieldTryFromError::Unrecoverable(e)) => {
+				return Err(e);
+			}
+			_ => {}
 		}
 
-		let Field { ident, ty, .. } = field;
-		let ident = ident.ok_or(Self::Error::NoIdent)?;
+		let Field { ident, ty, .. } = &field;
+		let ident = ident
+			.as_ref()
+			.ok_or(syn::Error::new_spanned(field.clone(), "No ident"))?;
 
-		Ok(Self::Required { ident, ty })
+		Ok(Self::Required {
+			ident: ident.clone(),
+			ty: ty.clone(),
+		})
 	}
 }
 
@@ -190,8 +217,10 @@ struct BuilderDerive {
 	pub fields: Vec<BDF>,
 }
 
-impl From<DeriveInput> for BuilderDerive {
-	fn from(input: DeriveInput) -> Self {
+impl TryFrom<DeriveInput> for BuilderDerive {
+	type Error = syn::Error;
+
+	fn try_from(input: DeriveInput) -> Result<Self, Self::Error> {
 		let syn::Data::Struct(syn::DataStruct {
 			fields: syn::Fields::Named(fields),
 			..
@@ -200,16 +229,15 @@ impl From<DeriveInput> for BuilderDerive {
 			panic!("Could not parse");
 		};
 
-		let fields: Result<_, _> = fields
+		fields
 			.named
 			.into_iter()
 			.map(|field| field.try_into())
-			.collect();
-
-		Self {
-			ident: input.ident,
-			fields: fields.unwrap(),
-		}
+			.collect::<Result<Vec<_>, _>>()
+			.map(|fields| Self {
+				ident: input.ident,
+				fields,
+			})
 	}
 }
 
@@ -275,7 +303,7 @@ impl quote::ToTokens for BuilderDerive {
 		let built_fields = self.fields.iter().map(|field| {
 			let ident = field.ident();
 
-			let error_text = format!("\"{}\" is not set", ident.to_string());
+			let error_text = format!("`{}` is not set", ident.to_string());
 
 			match field {
 				BDF::Required { .. } => quote! { #ident: self.#ident.take().ok_or(#error_text)?, },
@@ -293,7 +321,6 @@ impl quote::ToTokens for BuilderDerive {
 				#(#methods)*
 
 				 pub fn build(&mut self) -> ::core::result::Result<#ident, ::std::boxed::Box<dyn ::core::error::Error>> {
-
 					::core::result::Result::Ok(
 						#ident{ #(#built_fields)* }
 					)
@@ -313,7 +340,13 @@ impl quote::ToTokens for BuilderDerive {
 
 #[proc_macro_derive(Builder, attributes(builder))]
 pub fn derive(input: TokenStream) -> TokenStream {
-	let bd: BuilderDerive = syn::parse_macro_input!(input as DeriveInput).into();
+	let parsed = syn::parse_macro_input!(input as DeriveInput);
 
-	quote! { #bd }.into()
+	match parsed.try_into() {
+		Ok(bd @ BuilderDerive { .. }) => quote! { #bd }.into(),
+		Err(e) => {
+			let e = e.to_compile_error();
+			quote! { #e }.into()
+		}
+	}
 }
